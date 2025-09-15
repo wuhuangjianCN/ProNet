@@ -1,0 +1,402 @@
+using ProNetM,Dates,DataFrames,Statistics,TimeZones
+using utilities,LocalizerM
+pInfo=ProNetM.comData.pInfo
+
+# ================================ Model Emission ==========================
+mutable struct EmissionModelCell
+    encSpaceInit::Chain
+    encSpaceFore::Chain
+    init_foreMapper1::Chain
+    init_foreMapper2::Chain
+    init_foreMapper3::Chain
+    hidMap_inToHid::Chain
+    hidMap_foreToHid::Chain
+    hid::Chain
+    decSpace::Chain
+end
+function (m::EmissionModelCell)(x_STinit,x_STfore) 
+    W_init,H_init,C_init,T_init,B= size(x_STinit)
+    W_fore,H_fore,C_fore,T_fore,B= size(x_STfore)
+    # encoder ------------------    
+    # encode init
+    # println(size(x_STinit))
+    x_STinit,inT,B=ProNetM.toSpaceForm(x_STinit)
+    x_STinit=m.encSpaceInit[1:1](x_STinit)
+    # println(size(x_STinit))
+    skip_init_1,H_1,C_space1=ProNetM.spaceToTimeForm(x_STinit,T_init,B)
+    x_STinit=m.encSpaceInit[2:4](x_STinit)    
+    # println(size(x_STinit))
+    skip_init_2,H_2,C_space2=ProNetM.spaceToTimeForm(x_STinit,T_init,B)
+    x_STinit=m.encSpaceInit[5:end](x_STinit)    
+    # println(size(x_STinit))
+    skip_init_3,H_3,C_space3=ProNetM.spaceToTimeForm(x_STinit,T_init,B)
+    x_STinit,_,_=ProNetM.spaceToHidForm(x_STinit,T_init,B)
+    x_STinit=m.hidMap_inToHid(x_STinit)    
+    # println(size(x_STinit))
+    # encode fore
+    x_STfore,outT,B=ProNetM.toSpaceForm(x_STfore)
+    x_STfore=m.encSpaceFore[1:1](x_STfore)
+    skip_fore_1=copy(x_STfore)
+    x_STfore=m.encSpaceFore[2:4](x_STfore)
+    skip_fore_2=copy(x_STfore)
+    x_STfore=m.encSpaceFore[5:end](x_STfore)
+    skip_fore_3=copy(x_STfore)
+    x_STfore,_,_=ProNetM.spaceToHidForm(x_STfore,T_fore,B)
+    x_STfore=m.hidMap_foreToHid(x_STfore)
+    
+    # hidden ------------------
+    x=cat(x_STinit,x_STfore;dims=3)
+    x=m.hid(x)
+    # x=backFromHiddenForm(x,C,T)
+    x,_,_=ProNetM.hidToSpaceForm(x,C_space3,T_fore)
+
+    # bridge between inT and outT ------------------
+    skip_init_3=m.init_foreMapper3(skip_init_3)
+    skip_init_3,_,_=ProNetM.timeToSpaceForm(skip_init_3,H_3,C_space3)
+    skip_init_2=m.init_foreMapper2(skip_init_2)
+    skip_init_2,_,_=ProNetM.timeToSpaceForm(skip_init_2,H_2,C_space2)
+    skip_init_1=m.init_foreMapper1(skip_init_1)
+    skip_init_1,_,_=ProNetM.timeToSpaceForm(skip_init_1,H_1,C_space1)
+
+    # decoder ------------------ 
+    x=cat(x+skip_fore_3,x+skip_init_3;dims=3)
+    x=m.decSpace[1:4](x)
+    x=cat(x+skip_fore_2,x+skip_init_2;dims=3)
+    x=m.decSpace[5:7](x)
+    x=cat(x+skip_fore_1,x+skip_init_1;dims=3)
+    x=m.decSpace[8:end](x)
+    x=ProNetM.backFromSpaceForm( x ,outT,B)
+    return  x
+end
+Flux.@layer EmissionModelCell
+
+function getEmissionModel(inT,outT,inC_Einit,inC_Efore,outC,hid_S,hid_T;nGroup_space=[1,8,16],nGroup_hid=8,drop_prob=0.2)
+    # encoder decoder for Space -----------------------
+    encSpaceInit =Chain(
+        Conv((3, 3), inC_Einit => hid_S[1], swish;stride=1,pad = 1),
+        Conv((3, 3), hid_S[1] => hid_S[2], swish;stride=2,pad = 1),
+        # GroupNorm(hid_S[2],nGroup_space[2]),
+        Conv((3, 3), hid_S[2] => hid_S[2], swish;stride=1,pad = 1),
+        GroupNorm(hid_S[2],nGroup_space[2]),
+        Conv((3, 3), hid_S[2] => hid_S[3], swish;stride=2,pad = 1),
+        # GroupNorm(hid_S[3],nGroup_space[3]),
+        Conv((3, 3), hid_S[3] => hid_S[3], swish;stride=1,pad = 1),
+        GroupNorm(hid_S[3],nGroup_space[3]),
+    )# |> device
+    encSpaceFore =Chain(
+        Conv((3, 3), inC_Efore => hid_S[1], swish;stride=1,pad = 1),
+        Conv((3, 3), hid_S[1] => hid_S[2], swish;stride=2,pad = 1),
+        # GroupNorm(hid_S[2],nGroup_space[2]),
+        Conv((3, 3), hid_S[2] => hid_S[2], swish;stride=1,pad = 1),
+        GroupNorm(hid_S[2],nGroup_space[2]),
+        Conv((3, 3), hid_S[2] => hid_S[3], swish;stride=2,pad = 1),
+        # GroupNorm(hid_S[3],nGroup_space[3]),
+        Conv((3, 3), hid_S[3] => hid_S[3], swish;stride=1,pad = 1),
+        GroupNorm(hid_S[3],nGroup_space[3]),
+    ) 
+
+    init_foreMapper1=Chain(
+        Dropout(drop_prob), 
+        Conv((1, 1), inT => outT, swish) 
+    )
+    init_foreMapper2=Chain(
+        Dropout(drop_prob), 
+        Conv((1, 1), inT => outT, swish) 
+    )
+    init_foreMapper3=Chain(
+        Dropout(drop_prob), 
+        Conv((1, 1), inT => outT, swish) 
+    )
+
+    decSpace = Chain(
+        GroupNorm(2*hid_S[3],nGroup_space[3]),
+        Conv((3, 3), 2*hid_S[3] => hid_S[2]*4, swish;stride=1,pad = 1),
+        PixelShuffle(2),
+        # GroupNorm(hid_S,nGroup_space),
+        Conv((3, 3), hid_S[2] => hid_S[2], swish;stride=1,pad = (1,1)),
+        GroupNorm(2*hid_S[2],nGroup_space[2]),
+        Conv((3, 3), 2*hid_S[2] => hid_S[1]*4, swish;stride=1,pad = 1),
+        PixelShuffle(2),
+        # Conv((3, 3), hid_S[1] => hid_S[1], swish;stride=1,pad = 1),
+        Conv((3, 3), 2*hid_S[1] => hid_S[1], swish;stride=1,pad = 1),
+        Conv((3, 3), hid_S[1] => outC ;stride=1,pad = 1)        
+    ) 
+    # hidden -----------------------
+    hidMap_inToHid=Chain(
+        Dropout(drop_prob),
+        Conv((1, 1), inT*hid_S[3] => hid_T)# |> device
+    )
+    hidMap_foreToHid=Chain(
+        Dropout(drop_prob),    
+        Conv((1, 1), outT*hid_S[3] => hid_T)# |> device
+    )
+    hid = Chain(
+        ProNetM.GASubBlock(2*hid_T; kernel_size=21, drop_prob=drop_prob,nGroup=nGroup_hid),
+        ProNetM.Conv((1, 1), 2*hid_T => hid_T), # reduce channel to hid_T
+        ProNetM.GASubBlock(hid_T; kernel_size=21, drop_prob=drop_prob/2,nGroup=nGroup_hid),
+        ProNetM.GASubBlock(hid_T; kernel_size=21, drop_prob=drop_prob/4,nGroup=nGroup_hid),
+        ProNetM.GASubBlock(hid_T; kernel_size=21, drop_prob=drop_prob/6,nGroup=nGroup_hid),
+        # GASubBlock(hid_T; kernel_size=21, drop_prob=drop_prob/8,nGroup=nGroup_hid),
+        # GASubBlock(hid_T; kernel_size=21, drop_prob=0.0,nGroup=nGroup_hid),
+        Dropout(drop_prob),    
+        Conv((1, 1), hid_T=>outT*hid_S[3] ), # reduce channel to hid_T
+    )
+    modelST=EmissionModelCell(encSpaceInit,encSpaceFore,init_foreMapper1,init_foreMapper2,init_foreMapper3,hidMap_inToHid,hidMap_foreToHid,hid,decSpace) 
+    return modelST
+end
+
+# =========================== model Reaction ==========================
+function getReactionModel(inC_Rfore,hid_R,outC;ratio_drop=[0.1,0.1,0.1])
+    modelR=Chain(
+        Dense(inC_Rfore=>hid_R, tanh_fast),
+        Dropout(ratio_drop[1]), 
+        Dense(hid_R=>hid_R, tanh_fast),
+        Dropout(ratio_drop[2]), 
+        Dense(hid_R=>hid_R, tanh_fast),
+        Dropout(ratio_drop[3]),
+        Dense(hid_R=>outC)
+    )
+    return modelR
+end
+
+function getValidGrids(lonM,latM,staInfo;staNumLimit=20, space_cutoff=100e3,land=copy(ProNetM.comData.land))
+    # get lonlat_gridWithObs --------------
+    inds=utilities.getNearest(lonM,latM,staInfo.lon,staInfo.lat;outType="linearind")
+    inds=unique(inds)
+    lonlat_gridWithObs=hcat(lonM[inds],latM[inds])
+    # calculate valid sta number for each grid -------------
+    stateLonLat=hcat(vec(lonM),vec(latM))
+    locM=localizerM(stateLonLat,lonlat_gridWithObs)
+    validStaM=reshape(collect(sum(getLocCoef(locM,n_grid,space_cutoff;nargout=1)) for n_grid in eachindex(lonM)),size(lonM)...)
+    # select valid grid with enough sta around and not on the sea-------------
+    q_validGrid= (validStaM .> staNumLimit) .& (land .!= 17.0)
+    return q_validGrid
+end
+# function getRMesh(Times,xVar,poll;distThreadhould=50e3,pInfo=pInfo,q_validGrid=q_validGrid,startLead=4,sampleRatio=nothing)
+#     var2read=["erd_$(poll)_Err",poll, xVar...];
+#     data_naq=readInitBeforeStart(Times, var2read; startLead=startLead, disp=false, grdIn=pInfo.grdNaq, datFileFun=pInfo.foreFileFun);
+#     erdErr=data_naq[:,:,1:1,:]
+#     # constructing meshX --------------------------
+#     meshX=data_naq[:,:,indexin(xVar,var2read),:] # extract var of meshX
+#     # constructing meshY --------------------------
+#     datFun_ProNetM(tStart,varName)="$(outputFolder)/$varName.$(Dates.format(tStart,"yyyymmddHH")).dat"
+#     varED="$(poll)_predE"
+#     edErr=readInitBeforeStart(Times,varED;startLead=startLead, disp=false,grdIn=copy(pInfo.grdNaq),datFileFun=datFun_ProNetM,varInCtl="data");
+#     meshY=erdErr - edErr;
+#     # meshY=erdErr;
+    
+#     # constructing Y_isValid --------------------------    
+#     miniDist_data=readInitBeforeStart(Times,poll;startLead=startLead, disp=false,grdIn=copy(pInfo.grdRe),datFileFun=pInfo.reFileFun,varInCtl="miniDist");
+#     @views miniDist_data[:,:,:,2:end] = max.(miniDist_data[:,:,:,1:end-1],miniDist_data[:,:,:,2:end])
+#     Y_isValid=(miniDist_data .< distThreadhould) .& reshape(q_validGrid,size(q_validGrid,1),size(q_validGrid,2),1,1)
+#     if !isnothing(sampleRatio)
+#         Y_isValid=Y_isValid .* (rand(Float16,size(Y_isValid)) .< sampleRatio)
+#     end
+#     return meshX,meshY,Y_isValid
+# end
+function getRMesh_Var(Times,varNameS;pInfo=pInfo,startLead=4)
+    data_Var=readInitBeforeStart(Times, varNameS; startLead=startLead, disp=false, grdIn=copy(pInfo.grdNaq), datFileFun=pInfo.foreFileFun);
+    return data_Var
+end
+function getRMesh_valid(Times,poll;distThreadhould=50e3,pInfo=pInfo,q_validGrid=trues(pInfo.grdNaq.lonlatsize),startLead=4,sampleRatio=nothing)
+    # constructing Y_isValid --------------------------    
+    miniDist_data=readInitBeforeStart(Times,poll;startLead=startLead, disp=false,grdIn=copy(pInfo.grdRe),datFileFun=pInfo.reFileFun,varInCtl="miniDist");
+    @views miniDist_data[:,:,:,2:end] = max.(miniDist_data[:,:,:,1:end-1],miniDist_data[:,:,:,2:end])
+    Y_isValid=(miniDist_data .< distThreadhould) .& reshape(q_validGrid,size(q_validGrid,1),size(q_validGrid,2),1,1)
+    if !isnothing(sampleRatio)
+        Y_isValid=Y_isValid .* (rand(Float16,size(Y_isValid)) .< sampleRatio)
+    end
+    return Y_isValid
+end
+function getRsample(Times,varNameS,poll;distThreadhould=50e3,pInfo=pInfo,q_validGrid=trues(pInfo.grdNaq.lonlatsize),startLead=4,sampleRatio=nothing)
+    data_Var= getRMesh_Var(Times,varNameS;pInfo=pInfo,startLead=startLead)
+    Y_isValid=getRMesh_valid(Times,poll;distThreadhould=distThreadhould,pInfo=pInfo,q_validGrid=q_validGrid,startLead=startLead,sampleRatio=sampleRatio)
+    data_sample=getValidSample(data_Var,Y_isValid)
+    return data_sample
+end
+function getValidSample(dataMesh::AbstractArray{T},Y_isValid) where T
+    dataSample=Array{T,2}(undef,size(dataMesh,3),sum(Y_isValid))
+    Threads.@threads for i in 1:size(dataMesh,3)
+        # varCurr=view(dataMesh,:,:,i:i,:)
+        varCurr=dataMesh[:,:,i:i,:]
+        dataSample[i,:]=vec(varCurr[Y_isValid])
+    end
+    return dataSample
+end
+
+function getRX_aStart(tStart_file,norm_mean,norm_std;pInfo=pInfo,leads2Fore=leads2Fore,xVar=xVar)
+    Times2Fore=tStart_file .+ leads2Fore
+    data_aFore=readFore_aStart(tStart_file,xVar,Times2Fore;grdIn=copy(pInfo.grdNaq),datFileFun=pInfo.foreFileFun)
+    norm_mean=reshape(norm_mean,1,1,length(xVar),1)
+    norm_std=reshape(norm_std,1,1,length(xVar),1)
+    data_aFore=(data_aFore .- norm_mean)./norm_std
+    X_allLead=collect(reshape(data_aFore[1:end-1,:,:,l],:,length(xVar))' for l in eachindex(leads2Fore))
+    return X_allLead
+end
+function getRXmesh_aStart(tStart_file,norm_mean,norm_std;pInfo=pInfo,leads2Fore=leads2Fore,xVar=xVar)
+    Times2Fore=tStart_file .+ leads2Fore
+    data_aFore=readFore_aStart(tStart_file,xVar,Times2Fore;grdIn=copy(pInfo.grdNaq),datFileFun=pInfo.foreFileFun)
+    norm_mean=reshape(norm_mean,1,1,length(xVar),1)
+    norm_std=reshape(norm_std,1,1,length(xVar),1)
+    data_aFore=(data_aFore .- norm_mean)./norm_std
+    getRXmesh_aStart=data_aFore[1:end-1,:,:,:]
+    return getRXmesh_aStart
+end
+# function getRXY_chunk(Times,xVar,poll;nChunk=12,extraVar=[],distThreadhould=50e3,startLead=4,q_validGrid=trues(pInfo.grdNaq.lonlatsize),sampleRatio=nothing,outputFolder=outputFolder)
+#     var2read=[xVar...,extraVar...]
+#     data_all=[getRXY(
+#         getRMesh(tt,var2read,poll;startLead=startLead,distThreadhould=distThreadhould,q_validGrid=q_validGrid,sampleRatio=sampleRatio,outputFolder=outputFolder)...
+#         ) for tt in chunk(Times,nChunk)]
+#     X=hcat(collect(a[1] for a in data_all)...)
+#     Y=hcat(collect(a[2] for a in data_all)...)
+#     if isempty(extraVar)
+#         return X,Y
+#     else
+#         majorX=X[1:length(xVar),:];
+#         extX=X[(length(xVar)+1):end,:]
+#         return majorX,Y,extX
+#     end
+# end
+
+# ================================= model Initialize ====================================
+function getModelER(;
+    xVar_Einit=["erd_PM25_Err","PM25","erd_PM25","PM25_Err","U","V","windSpeed","windDiv","Ter","Land","holiday","TEMP","RH"],
+    xVar_Efore=["PM25","erd_PM25","U","V","windSpeed","windDiv","Ter","Land","holiday","TEMP","RH"],    
+    xVar_Rfore=["erd_AER","erd_ANH4", "erd_ANO3", "erd_PM25",
+        "erd_HONO", "erd_ASO4", "erd_NH3", "erd_OC", "erd_HCHO",  "erd_PMF", "erd_CO", "erd_NO2",
+        "erd_BC","erd_SOA", "erd_NO", "erd_C2H6", "erd_SO2","erd_ISOP", "erd_O3", "erd_HNO3", "TEMP", "RH"],
+    yVarName="erd_PM25_Err",
+    initNorm=true,
+    hid_S=[8,32,128],hid_T=512,hid_R=1024,
+    nGroup_space=[1,8,16],nGroup_hid=32,   nGroup_R=84,  drop_probE=0.2,
+    inT=176,outT=176,
+    leads2init=Hour.(-(inT-1):0),
+    leads2Fore=Hour.(1:outT),
+    inC_Einit=length(xVar_Einit),
+    inC_Efore=length(xVar_Efore),
+    inC_Rfore=length(xVar_Rfore),
+    Rdrop_ratio=[0.1,0.1,0.1] .* 2,
+    outC=1,
+    distThreadhould=80e3
+    )
+
+    # constructing the model -------------------------
+    modelE=getEmissionModel(inT,outT,inC_Einit,inC_Efore,outC,hid_S,hid_T;nGroup_space=nGroup_space,nGroup_hid=nGroup_hid,drop_prob=drop_probE)
+    modelR=getReactionModel(inC_Rfore,hid_R,outC;ratio_drop=Rdrop_ratio)
+
+    # constructing normLayer ----------------
+    var_allE=unique(vcat(xVar_Einit,xVar_Efore))
+    q_zeroMean=[startswith(x,"erd_") || endswith(x,"_Err") for x in var_allE]
+    Times2init=ZonedDateTime.(vcat(collect(DateTime(2022) .+ Day(d) .+ Hour.(0:23) for d in 0:15:365)...),tz"Asia/Shanghai")
+    if initNorm
+        # for modelE ---------------
+        X_XTinit=readInitBeforeStart(Times2init,var_allE;startLead=4)
+        normLayer=NormPoll(X_XTinit,var_allE;q_zeroMean=q_zeroMean)
+        # for modelR ---------------
+        X_Rsample=getRsample(Times2init,xVar_Rfore,poll;distThreadhould=distThreadhould,pInfo=pInfo,startLead=4)
+        norm_mean=mapslices(mean,X_Rsample,dims=2)
+        norm_mean[startswith.(xVar_Rfore,"erd_")] .= 0
+        norm_std=mapslices(std,X_Rsample,dims=2)
+        normR=(mean=norm_mean,std=norm_std)
+    else
+        normLayer=nothing;
+        normR=nothing
+    end
+        
+    info=(xVar_Einit=xVar_Einit,
+        xVar_Efore=xVar_Efore,
+        xVar_Rfore=xVar_Rfore,
+        yVarName=yVarName,
+        inT=inT, outT=outT,
+        inC_Einit=inC_Einit,inC_Efore=inC_Efore,
+        inC_Rfore=inC_Rfore,
+        hid_S=hid_S, hid_T=hid_T, 
+        hid_R=hid_R,
+        nGroup_space=nGroup_space,nGroup_hid=nGroup_hid,drop_probE=drop_probE,
+        nGroup_R=nGroup_R,
+        outC=outC,
+        leads2init=leads2init,
+        leads2Fore=leads2Fore,
+        normLayer=normLayer,
+        Rdrop_ratio=Rdrop_ratio,
+        normR)
+    return modelE,modelR,normLayer,info
+end
+
+# =========================== data processing ==========================
+function addADim(dataIn)
+    return reshape(dataIn,size(dataIn)...,1)
+end
+function getEdata_aStart(tStart,xVar_Einit,xVar_Efore,yVarName,leads2init,leads2Fore;pInfo=ProNetM.comData.pInfo,tLastLimit=nothing)
+    # println(tStart,xNaqVar_allE,yVarName,epoch_all,leads_all)
+    pollName=replace(yVarName, "erd_" => "", "_Err" => "", "_Ana" => "")
+    tStart_file=astimezone(tStart,tz"UTC")
+    Times2init=tStart_file .+ leads2init
+    Times2Fore=tStart_file .+ leads2Fore
+    # println("Y_fore")
+    tsk_Y_fore= Threads.@spawn addADim(readFore_aStart(tStart_file,yVarName,Times2Fore;grdIn=copy(pInfo.grdNaq),datFileFun=pInfo.foreFileFun)) 
+    tsk_Y_isValid= Threads.@spawn addADim(readValidGrid(tStart_file,pollName,Times2Fore;grdre=copy(pInfo.grdRe),datFileFun=pInfo.reFileFun,distThreadhould=pInfo.validLength))
+    tsk_xData_Einit=  Threads.@spawn addADim(readInitBeforeStart(Times2init, xVar_Einit; startLead=4, disp=false, grdIn=pInfo.grdNaq, datFileFun=pInfo.foreFileFun))
+    # set data exceed 20230101 to invalid
+    if isnothing(tLastLimit )
+        Y_isValid=fetch(tsk_Y_isValid)
+    else
+        qt_isvalid=reshape(Times2Fore .< tLastLimit,1,1,1,:,1)
+        Y_isValid=fetch(tsk_Y_isValid) .& qt_isvalid
+    end
+    # println("Naq_aStart")
+    tsk_xData_Efore= Threads.@spawn addADim(readFore_aStart(tStart_file,xVar_Efore,Times2Fore;grdIn=copy(pInfo.grdNaq), datFileFun=pInfo.foreFileFun))
+    return (Y_fore=fetch(tsk_Y_fore),Y_isValid=Y_isValid,xData_Einit=fetch(tsk_xData_Einit),
+        xData_Efore=fetch(tsk_xData_Efore))
+end
+
+function dataProcessor(data,info)
+    tsk_Y_isValid= Threads.@spawn data.Y_isValid[1:end-1,:,:,:,:]
+    tsk_Y_fore= Threads.@spawn data.Y_fore[1:end-1,:,:,:,:]
+    tsk_X_Einit= Threads.@spawn info.normLayer(data.xData_Einit[1:end-1,:,:,:,:],info.xVar_Einit)
+    tsk_X_Efore= Threads.@spawn info.normLayer(data.xData_Efore[1:end-1,:,:,:,:],info.xVar_Efore)
+
+    Y_isValid=fetch(tsk_Y_isValid)
+    Y_fore=fetch(tsk_Y_fore)
+    dataOut=(
+        X_Einit=fetch(tsk_X_Einit),
+        X_Efore=fetch(tsk_X_Efore),
+        Y_isValid=Y_isValid,
+        Y_fore=Y_fore,
+    )
+    return dataOut
+end
+
+mutable struct looperS
+    tStart_all::AbstractArray
+    idx_all::AbstractArray
+    nextIdx::Int
+    shuffle::Bool
+    data_info::NamedTuple
+    tReaded::ZonedDateTime
+end
+function looperS(tStart_all,data_info,isShuffle)
+    return reset!(looperS(tStart_all,[],1,isShuffle,data_info,ZonedDateTime(2000,tz"UTC")))
+end
+function reset!(l::looperS)
+    if l.shuffle
+        l.idx_all=collect(eachobs(1:length(l.tStart_all),shuffle=true))
+    else
+        l.idx_all=1:length(l.tStart_all)
+    end
+    l.nextIdx=1
+    return l
+end
+
+function next(l::looperS)
+    tStart=l.tStart_all[l.idx_all[l.nextIdx]]
+    info=l.data_info
+    data=dataProcessor(getEdata_aStart(tStart,info.xVar_Einit,info.xVar_Efore,info.yVarName,info.leads2init,info.leads2Fore;pInfo=info.pInfo),info)
+    if l.nextIdx >= length(l.tStart_all)
+        reset!(l)
+    else
+        l.nextIdx +=1
+    end
+    l.tReaded=tStart
+    return data
+end

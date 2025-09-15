@@ -1,0 +1,5 @@
+include("test_trainCorrectors_inETM_O3.jl")
+include("test_generateCorrectorOuputs_inETM_O3.jl")
+include("test_generateEnsembleForecasts_Couple_O3.jl")
+include("test_trainEnsemble_Couple_O3.jl")
+include("test_generateFinalForecast_Couple_O3.jl")
